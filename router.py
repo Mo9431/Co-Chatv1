@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 from typing import Awaitable, Callable
 
-from browser.controller import AIController
 from core.logger import JsonlLogger
 from core.message import Message
 from core.state import RuntimeState
@@ -14,7 +14,7 @@ EventListener = Callable[[Message], Awaitable[None] | None]
 class Router:
     def __init__(
         self,
-        controllers: dict[str, AIController],
+        controllers: dict[str, Any],
         logger: JsonlLogger,
         state: RuntimeState,
         poll_interval: float,
@@ -197,13 +197,25 @@ class Router:
 
         return "\n".join(lines)
 
+    async def probe_text(self) -> str:
+        lines = ["Selector probe:"]
+        for name in sorted(self.controllers):
+            results = await self.controllers[name].probe_selectors()
+            lines.append(f"- {name}")
+            for selector_name in ("input", "send_btn", "last_assistant", "streaming_indicator"):
+                result = results[selector_name]
+                lines.append(
+                    f"  {selector_name}: {result['status']} ({result['detail']})"
+                )
+        return "\n".join(lines)
+
     async def handle_command(self, line: str, interface: str = "cli") -> str:
         text = line.strip()
         if not text:
             return ""
 
         command, _, remainder = text.partition(" ")
-        command = command.lower()
+        command = self._normalize_command(command)
         payload = remainder.strip()
 
         if command in self.controllers:
@@ -246,6 +258,9 @@ class Router:
         if command == "status":
             return self.status_text()
 
+        if command == "probe":
+            return await self.probe_text()
+
         if command == "routes":
             return self.routes_text()
 
@@ -267,15 +282,29 @@ class Router:
             self.request_shutdown()
             return "Shutting down."
 
-        if command == "help":
-            return (
-                "Commands: gpt <text>, claude <text>, grok <text>, all <text>, "
-                "compare <prompt>, "
-                "status, routes, relay <source> <target>, "
-                "stoproute <source> <target>, quit"
-            )
+        if command in {"help", "start"}:
+            return self.help_text()
 
         return f"Unknown command: {command}. Type 'help' for commands."
+
+    def help_text(self) -> str:
+        provider_commands = ", ".join(
+            f"{name} <text>" for name in sorted(self.controllers)
+        )
+        return (
+            f"Commands: {provider_commands}, all <text>, compare <prompt>, "
+            "status, probe, routes, relay <source> <target>, "
+            "stoproute <source> <target>, quit"
+        )
+
+    @staticmethod
+    def _normalize_command(command: str) -> str:
+        normalized = command.strip().lower()
+        if normalized.startswith("/"):
+            normalized = normalized[1:]
+        if "@" in normalized:
+            normalized = normalized.split("@", 1)[0]
+        return normalized
 
     async def _forward_reply(self, source: str, text: str) -> None:
         for route_source, route_target in self.state.list_routes():

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from aiogram import Bot, Dispatcher
+from aiogram.types import BotCommand
 from aiogram.types import Message as TelegramMessage
 
 from core.message import Message
@@ -25,6 +26,14 @@ class TelegramControl:
             raise RuntimeError("ENABLE_TELEGRAM is true but BOT_TOKEN is empty.")
 
         self.bot = Bot(self.bot_token)
+        await self.bot.set_my_commands(
+            [
+                BotCommand(command="help", description="Show available Co-Chat commands"),
+                BotCommand(command="status", description="Show provider status"),
+                BotCommand(command="probe", description="Probe selector health"),
+                BotCommand(command="routes", description="List active relay routes"),
+            ]
+        )
         self.dispatcher = Dispatcher()
         self.dispatcher.message.register(self._handle_message)
         self.poll_task = asyncio.create_task(

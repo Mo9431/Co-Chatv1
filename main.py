@@ -12,6 +12,9 @@ from config.config import (
     BOT_TOKEN,
     BROWSER_ARGS,
     CHAT_ID,
+    CHROME_CHANNEL,
+    CHROME_EXECUTABLE_PATH,
+    CODEX_BIN,
     ENABLE_TELEGRAM,
     ENABLED_PROVIDERS,
     HEADLESS,
@@ -55,6 +58,9 @@ async def run() -> int:
             browser_args=BROWSER_ARGS,
             action_timeout_ms=ACTION_TIMEOUT_MS,
             navigation_timeout_ms=NAVIGATION_TIMEOUT_MS,
+            preferred_channel=CHROME_CHANNEL,
+            preferred_executable_path=CHROME_EXECUTABLE_PATH,
+            codex_bin=CODEX_BIN,
         )
 
         router = Router(

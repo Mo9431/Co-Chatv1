@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from typing import Any
 from urllib.parse import urlparse
 
-from playwright.async_api import BrowserContext, Error, Page
+from playwright.async_api import BrowserContext, Error, Locator, Page
 
 from core.logger import JsonlLogger
 from core.message import utc_now_iso
@@ -13,6 +14,7 @@ from core.message import utc_now_iso
 class AIController:
     MIN_REPLY_LENGTH = 6
     STABLE_POLLS_REQUIRED = 2
+    FALLBACK_STABLE_POLLS_REQUIRED = 3
 
     def __init__(
         self,
@@ -29,11 +31,13 @@ class AIController:
         self.page: Page | None = None
         self.ready = False
         self.last_error: str | None = None
-        self.last_emitted_assistant: str | None = None
+        self.last_seen_hash: str | None = None
+        self.last_seen_text: str | None = None
+        self.last_emitted_hash: str | None = None
+        self.last_sent_text: str | None = None
         self.last_assistant_timestamp: str | None = None
         self.selector_health = "unknown"
-        self._pending_assistant: str | None = None
-        self._pending_seen_count = 0
+        self.stability_count = 0
         self._page_lock = asyncio.Lock()
 
     async def start(
@@ -60,23 +64,29 @@ class AIController:
                 if not input_selector:
                     raise ValueError(f"Missing input selector for {self.name}")
 
-                input_locator = self.page.locator(input_selector).first
-                await input_locator.wait_for(state="visible")
+                input_locator = await self._first_visible_locator(input_selector)
+                if input_locator is None:
+                    raise RuntimeError(
+                        f"No visible input matched selector for {self.name}: {input_selector}"
+                    )
                 await input_locator.click()
                 await self.page.keyboard.press("Control+A")
                 await self.page.keyboard.press("Backspace")
                 await self.page.keyboard.insert_text(text)
 
-                send_selector = self.selectors.get("send_button")
+                send_selector = self.selectors.get("send_btn")
                 if send_selector:
-                    send_locator = self.page.locator(send_selector)
-                    if await send_locator.count() > 0:
-                        await send_locator.first.click()
-                    else:
+                    send_locator = await self._first_visible_locator(send_selector)
+                    try:
+                        if send_locator is None:
+                            raise RuntimeError("No visible send button matched selector.")
+                        await send_locator.click(timeout=2000)
+                    except Exception:
                         await self.page.keyboard.press("Enter")
                 else:
                     await self.page.keyboard.press("Enter")
 
+                self.last_sent_text = self._normalize_text(text)
                 self.ready = True
                 self.last_error = None
                 self._set_selector_health("ok")
@@ -95,24 +105,33 @@ class AIController:
                 latest = await self._latest_assistant_text()
                 if not latest or not self._is_substantive(latest):
                     return None
-                if await self._is_streaming():
-                    return None
-                if latest == self.last_emitted_assistant:
+                if self.last_sent_text and latest == self.last_sent_text:
                     return None
 
-                if latest != self._pending_assistant:
-                    self._pending_assistant = latest
-                    self._pending_seen_count = 1
+                latest_hash = self._hash_text(latest)
+                if latest_hash == self.last_seen_hash:
+                    self.stability_count += 1
+                else:
+                    self.last_seen_hash = latest_hash
+                    self.last_seen_text = latest
+                    self.stability_count = 1
+
+                streaming_selector_configured, streaming_visible = await self._streaming_state()
+                if streaming_visible:
                     return None
 
-                self._pending_seen_count += 1
-                if self._pending_seen_count < self.STABLE_POLLS_REQUIRED:
+                required_polls = (
+                    self.STABLE_POLLS_REQUIRED
+                    if streaming_selector_configured
+                    else self.FALLBACK_STABLE_POLLS_REQUIRED
+                )
+                if self.stability_count < required_polls:
+                    return None
+                if latest_hash == self.last_emitted_hash:
                     return None
 
-                self.last_emitted_assistant = latest
+                self.last_emitted_hash = latest_hash
                 self.last_assistant_timestamp = utc_now_iso()
-                self._pending_assistant = None
-                self._pending_seen_count = 0
                 self.last_error = None
                 self.ready = True
                 self._set_selector_health("ok")
@@ -151,45 +170,69 @@ class AIController:
             raise RuntimeError(f"{self.name} has no page.")
 
         self._validate_selector_config()
-        ready_selector = self.selectors.get("ready") or self.selectors.get("input")
+        ready_selector = self.selectors.get("input")
         assert ready_selector is not None
 
-        try:
-            await self.page.wait_for_selector(ready_selector, state="visible")
-        except Exception as exc:
-            self._set_selector_health(f"ready-failed: {exc}")
-            raise
+        deadline = asyncio.get_running_loop().time() + 30
+        while asyncio.get_running_loop().time() < deadline:
+            locator = await self._first_visible_locator(ready_selector)
+            if locator is not None:
+                self.ready = True
+                return
+            await asyncio.sleep(0.25)
+
+        detail = f"No visible input matched selector within timeout: {ready_selector}"
+        self._set_selector_health(f"ready-failed: {detail}")
+        raise RuntimeError(detail)
         self.ready = True
 
     async def _latest_assistant_text(self) -> str | None:
         if self.page is None:
             return None
 
-        messages_selector = self.selectors.get("assistant_messages")
+        messages_selector = self.selectors.get("last_assistant")
         if not messages_selector:
-            self._set_selector_health("missing: assistant_messages")
-            raise ValueError(f"Missing assistant_messages selector for {self.name}")
+            self._set_selector_health("missing: last_assistant")
+            raise ValueError(f"Missing last_assistant selector for {self.name}")
 
         locator = self.page.locator(messages_selector)
-        count = await locator.count()
-        if count == 0:
-            return None
+        return await self._last_visible_text(locator)
 
-        latest = await locator.nth(count - 1).inner_text()
-        return self._normalize_text(latest)
+    async def probe_selectors(self) -> dict[str, dict[str, str]]:
+        async with self._page_lock:
+            if (self.page is None or self.page.is_closed()) and self.context is not None:
+                try:
+                    await self._start_locked(context=self.context)
+                except Exception as exc:
+                    return {
+                        "input": {"status": "FAIL", "detail": f"page unavailable: {exc}"},
+                        "send_btn": {"status": "FAIL", "detail": f"page unavailable: {exc}"},
+                        "last_assistant": {"status": "FAIL", "detail": f"page unavailable: {exc}"},
+                        "streaming_indicator": {"status": "FAIL", "detail": f"page unavailable: {exc}"},
+                    }
 
-    async def _is_streaming(self) -> bool:
+            return {
+                "input": await self._probe_required_visible("input"),
+                "send_btn": await self._probe_required_visible("send_btn"),
+                "last_assistant": await self._probe_last_assistant(),
+                "streaming_indicator": await self._probe_streaming_indicator(),
+            }
+
+    async def _streaming_state(self) -> tuple[bool, bool]:
         if self.page is None:
-            return False
+            return False, False
 
         streaming_selector = self.selectors.get("streaming_indicator")
         if not streaming_selector:
-            return False
+            return False, False
 
-        locator = self.page.locator(streaming_selector)
-        if await locator.count() == 0:
-            return False
-        return await locator.first.is_visible()
+        try:
+            locator = self.page.locator(streaming_selector)
+            if await locator.count() == 0:
+                return True, False
+            return True, await locator.first.is_visible()
+        except Exception:
+            return False, False
 
     async def _get_or_create_page(self, context: BrowserContext) -> Page:
         target_host = urlparse(self.url).netloc
@@ -241,10 +284,12 @@ class AIController:
 
         await self._wait_for_ready()
         existing = await self._latest_assistant_text()
-        self.last_emitted_assistant = existing
+        existing_hash = self._hash_text(existing) if existing else None
+        self.last_seen_hash = existing_hash
+        self.last_seen_text = existing
+        self.last_emitted_hash = existing_hash
         self.last_assistant_timestamp = utc_now_iso() if existing else None
-        self._pending_assistant = None
-        self._pending_seen_count = 0
+        self.stability_count = 0
         self.ready = True
         self.last_error = None
         self._set_selector_health("ok")
@@ -254,10 +299,12 @@ class AIController:
 
         if not self.selectors.get("input"):
             missing.append("input")
-        if not (self.selectors.get("ready") or self.selectors.get("input")):
-            missing.append("ready")
-        if not self.selectors.get("assistant_messages"):
-            missing.append("assistant_messages")
+        if not self.selectors.get("send_btn"):
+            missing.append("send_btn")
+        if "streaming_indicator" not in self.selectors:
+            missing.append("streaming_indicator")
+        if not self.selectors.get("last_assistant"):
+            missing.append("last_assistant")
 
         if missing:
             self._set_selector_health(f"missing: {', '.join(sorted(set(missing)))}")
@@ -270,3 +317,94 @@ class AIController:
 
     def _is_substantive(self, text: str) -> bool:
         return len(text.strip()) >= self.MIN_REPLY_LENGTH
+
+    async def _probe_required_visible(self, key: str) -> dict[str, str]:
+        if self.page is None:
+            return {"status": "FAIL", "detail": "page unavailable"}
+
+        selector = self.selectors.get(key)
+        if not selector:
+            return {"status": "FAIL", "detail": "selector missing"}
+
+        try:
+            locator = self.page.locator(selector)
+            count = await locator.count()
+            if count == 0:
+                return {"status": "FAIL", "detail": "no match"}
+            visible_locator = await self._first_visible_locator(selector)
+            if visible_locator is None:
+                return {"status": "FAIL", "detail": f"matched {count}, none visible"}
+            return {"status": "OK", "detail": "visible"}
+        except Exception as exc:
+            return {"status": "FAIL", "detail": str(exc)}
+
+    async def _probe_last_assistant(self) -> dict[str, str]:
+        if self.page is None:
+            return {"status": "FAIL", "detail": "page unavailable"}
+
+        selector = self.selectors.get("last_assistant")
+        if not selector:
+            return {"status": "FAIL", "detail": "selector missing"}
+
+        try:
+            locator = self.page.locator(selector)
+            text = await self._last_visible_text(locator)
+            if text is None:
+                return {"status": "FAIL", "detail": "no match"}
+            return {"status": "OK", "detail": "matched text"}
+        except Exception as exc:
+            return {"status": "FAIL", "detail": str(exc)}
+
+    async def _probe_streaming_indicator(self) -> dict[str, str]:
+        if self.page is None:
+            return {"status": "FAIL", "detail": "page unavailable"}
+
+        selector = self.selectors.get("streaming_indicator")
+        if not selector:
+            return {"status": "OK", "detail": "fallback mode"}
+
+        try:
+            locator = self.page.locator(selector)
+            count = await locator.count()
+            if count == 0:
+                return {"status": "OK", "detail": "configured, not active"}
+            if await locator.first.is_visible():
+                return {"status": "OK", "detail": "visible"}
+            return {"status": "OK", "detail": "configured, hidden"}
+        except Exception as exc:
+            return {"status": "FAIL", "detail": str(exc)}
+
+    @staticmethod
+    def _hash_text(text: str | None) -> str | None:
+        if not text:
+            return None
+        return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+    async def _first_visible_locator(self, selector: str) -> Locator | None:
+        if self.page is None:
+            return None
+
+        locator = self.page.locator(selector)
+        count = await locator.count()
+        for index in range(count):
+            candidate = locator.nth(index)
+            try:
+                if await candidate.is_visible():
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    async def _last_visible_text(self, locator: Locator) -> str | None:
+        count = await locator.count()
+        for index in range(count - 1, -1, -1):
+            candidate = locator.nth(index)
+            try:
+                if not await candidate.is_visible():
+                    continue
+                text = self._normalize_text(await candidate.inner_text())
+                if text:
+                    return text
+            except Exception:
+                continue
+        return None
