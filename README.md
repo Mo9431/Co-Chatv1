@@ -168,7 +168,7 @@ Telegram accepts the same core commands as CLI. Useful slash forms:
 /stoproute gpt deepseek
 ```
 
-## Codex local provider
+## Codex local provider + Codex Remote via Telegram
 
 `codex` in Co-Chat is a local provider backed by the installed Codex CLI, not a browser tab.
 
@@ -176,7 +176,8 @@ Telegram accepts the same core commands as CLI. Useful slash forms:
 - It does not attach to this live Codex desktop conversation unless you explicitly build that bridge later
 - The first `codex <text>` creates a fresh Codex session for Co-Chat
 - Later `codex <text>` calls resume the same Co-Chat-owned Codex thread
-
+- Telegram can be used as a remote for Codex CLI
+  
 If you want to disable it:
 
 ```bash
